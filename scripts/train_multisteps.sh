@@ -12,4 +12,4 @@ fi
 
 parse_gpu_and_args "$@"
 
-run_mnist --accum-method multisteps --accum-steps "$ACCUM_STEPS" "${EXTRA_ARGS[@]}"
+run_mnist --accum-method multisteps --accum-steps "$ACCUM_STEPS" --epochs "$EPOCHS" --warmup-epochs "$WARMUP_EPOCHS" "${EXTRA_ARGS[@]}"

@@ -9,6 +9,8 @@ PYTHON="${PYTHON:-python}"
 # Shared defaults for comparable runs across scripts.
 BATCH_SIZE="${BATCH_SIZE:-32}"
 ACCUM_STEPS="${ACCUM_STEPS:-4}"
+EPOCHS="${EPOCHS:-5}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-1}"
 BENCHMARK_STEPS="${BENCHMARK_STEPS:-100}"
 WARMUP_STEPS="${WARMUP_STEPS:-10}"
 
@@ -22,7 +24,9 @@ Environment:
   GPU              GPU index (default: 0)
   BATCH_SIZE       Effective batch without accumulation (default: 32)
   ACCUM_STEPS      Micro-batches per effective batch when accumulating (default: 4)
-  BENCHMARK_STEPS  Timed optimizer-equivalent steps in benchmark (default: 100)
+  EPOCHS           Training epochs for full training runs (default: 5)
+  WARMUP_EPOCHS    Epochs excluded from FPS timing (default: 1)
+  BENCHMARK_STEPS  Timed optimizer-equivalent steps in benchmark mode (default: 100)
   WARMUP_STEPS     Warmup steps before timing in benchmark (default: 10)
   PYTHON           Python interpreter (default: python)
 
@@ -33,11 +37,13 @@ Comparable setup:
                    effective batch = BATCH_SIZE
 
 For FPS comparison use:
-  ./scripts/benchmark.sh
+  ./scripts/benchmark.sh          # short timed benchmark
+  ./scripts/train_compare.sh      # full training + accuracy + FPS
 
 Examples:
   GPU=0 ./scripts/benchmark.sh
-  BATCH_SIZE=32 ACCUM_STEPS=4 ./scripts/benchmark.sh
+  GPU=0 ./scripts/train_compare.sh
+  BATCH_SIZE=32 ACCUM_STEPS=4 ./scripts/train_compare.sh
   GPU=1 ./scripts/train_multisteps.sh
 EOF
 }

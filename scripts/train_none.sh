@@ -13,4 +13,4 @@ fi
 
 parse_gpu_and_args "$@"
 
-run_mnist --accum-method none "${EXTRA_ARGS[@]}"
+run_mnist --accum-method none --epochs "$EPOCHS" --warmup-epochs "$WARMUP_EPOCHS" "${EXTRA_ARGS[@]}"

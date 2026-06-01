@@ -18,6 +18,15 @@ class BatchConfig:
     microbatch_size: int
     step_size: int
 
+@dataclass(frozen=True)
+class TrainMetrics:
+    test_accuracy: float
+    final_loss: float
+    examples_per_sec: float
+    train_time_sec: float
+    timed_examples: int
+    num_epochs: int
+
 class Net(nn.Module):
     def setup(self):
         self.conv1 = nn.Conv(features=32, kernel_size=(3, 3))
@@ -66,6 +75,23 @@ def parse_args():
         type=int,
         default=4,
         help='Micro-batches to accumulate before each optimizer update (default: 4)',
+    )
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=5,
+        help='Number of training epochs (default: 5)',
+    )
+    parser.add_argument(
+        '--warmup-epochs',
+        type=int,
+        default=1,
+        help='Epochs excluded from FPS timing while JIT compiles (default: 1)',
+    )
+    parser.add_argument(
+        '--compare-all',
+        action='store_true',
+        help='Train all accumulation methods and compare accuracy with FPS',
     )
     parser.add_argument(
         '--benchmark',
@@ -147,13 +173,14 @@ def make_optimizer(accum_method, accum_steps):
         return optax.MultiSteps(base_tx, every_k_schedule=accum_steps)
     return base_tx
 
-def make_train_step(grad_fn, tx):
+def make_train_step(grad_fn, loss_fn, tx):
     @jit
     def train_step(params, opt_state, images, labels, dropout_key):
+        loss = loss_fn(params, images, labels, dropout_key)
         grads = grad_fn(params, images, labels, dropout_key)
         updates, opt_state = tx.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
-        return params, opt_state
+        return params, opt_state, loss
 
     return train_step
 
@@ -186,8 +213,14 @@ def make_fixed_batches(train_images, train_labels, batch_size, num_batches):
 
 def run_train_step(train_step, params, opt_state, images, labels, key):
     key, dropout_key = random.split(key)
-    params, opt_state = train_step(params, opt_state, images, labels, dropout_key)
-    return params, opt_state, key
+    params, opt_state, loss = train_step(
+        params, opt_state, images, labels, dropout_key)
+    return params, opt_state, key, loss
+
+def evaluate(model, params, test_images, test_labels):
+    test_logits = model.apply(params, test_images, training=False)
+    test_predictions = jnp.argmax(test_logits, axis=-1)
+    return float(jnp.mean(test_predictions == test_labels))
 
 def benchmark_method(
     model,
@@ -200,7 +233,7 @@ def benchmark_method(
     num_steps,
     warmup_steps,
 ):
-    params, opt_state, grad_fn, tx, _ = init_training_state(
+    params, opt_state, grad_fn, tx, loss_fn = init_training_state(
         model,
         accum_method,
         accum_steps,
@@ -208,7 +241,7 @@ def benchmark_method(
         key,
         train_images[0:1],
     )
-    train_step = make_train_step(grad_fn, tx)
+    train_step = make_train_step(grad_fn, loss_fn, tx)
 
     if accum_method == 'none':
         single_batches = make_fixed_batches(
@@ -222,7 +255,7 @@ def benchmark_method(
             nonlocal params, opt_state, key
             for step in range(count):
                 images, labels = single_batches[start_idx + step]
-                params, opt_state, key = run_train_step(
+                params, opt_state, key, _ = run_train_step(
                     train_step, params, opt_state, images, labels, key)
             params, opt_state = jax.block_until_ready((params, opt_state))
 
@@ -243,7 +276,7 @@ def benchmark_method(
             nonlocal params, opt_state, key
             for step in range(count):
                 images, labels = micro_batches[start_idx + step]
-                params, opt_state, key = run_train_step(
+                params, opt_state, key, _ = run_train_step(
                     train_step, params, opt_state, images, labels, key)
             params, opt_state = jax.block_until_ready((params, opt_state))
 
@@ -263,7 +296,7 @@ def benchmark_method(
             nonlocal params, opt_state, key
             for step in range(count):
                 images, labels = full_batches[start_idx + step]
-                params, opt_state, key = run_train_step(
+                params, opt_state, key, _ = run_train_step(
                     train_step, params, opt_state, images, labels, key)
             params, opt_state = jax.block_until_ready((params, opt_state))
 
@@ -332,10 +365,13 @@ def train(
     loss_fn,
     train_images,
     train_labels,
+    test_images,
+    test_labels,
     key,
     accum_method,
     batch_config,
     num_epochs,
+    warmup_epochs,
 ):
     if accum_method != 'none':
         print(
@@ -347,24 +383,140 @@ def train(
         print(f'Batch size: {batch_config.effective_batch_size}')
 
     step_size = batch_config.step_size
+    train_step = make_train_step(grad_fn, loss_fn, tx)
+    timed_examples = 0
+    final_loss = 0.0
+    train_start = None
 
     for epoch in range(num_epochs):
+        epoch_examples = 0
         for i in range(0, len(train_images), step_size):
             batch_images = train_images[i:i + step_size]
             batch_labels = train_labels[i:i + step_size]
+            batch_examples = int(batch_images.shape[0])
+            if batch_examples == 0:
+                continue
 
-            key, dropout_key = random.split(key)
-
-            loss = loss_fn(params, batch_images, batch_labels, dropout_key)
-            grads = grad_fn(params, batch_images, batch_labels, dropout_key)
-
-            updates, opt_state = tx.update(grads, opt_state)
-            params = optax.apply_updates(params, updates)
+            params, opt_state, key, loss = run_train_step(
+                train_step, params, opt_state, batch_images, batch_labels, key)
+            final_loss = float(loss)
+            epoch_examples += batch_examples
 
             if i % (step_size * 100) == 0:
-                print(f'Epoch {epoch + 1}, Loss: {loss}')
+                print(f'Epoch {epoch + 1}, Loss: {final_loss}')
 
-    return params, key
+        params, opt_state = jax.block_until_ready((params, opt_state))
+
+        if epoch >= warmup_epochs:
+            if train_start is None:
+                train_start = time.perf_counter()
+            timed_examples += epoch_examples
+
+        print(f'Epoch {epoch + 1}/{num_epochs} complete')
+
+    train_time_sec = (
+        time.perf_counter() - train_start if train_start is not None else 0.0
+    )
+    examples_per_sec = timed_examples / train_time_sec if train_time_sec > 0 else 0.0
+
+    test_accuracy = evaluate(model, params, test_images, test_labels)
+    metrics = TrainMetrics(
+        test_accuracy=test_accuracy,
+        final_loss=final_loss,
+        examples_per_sec=examples_per_sec,
+        train_time_sec=train_time_sec,
+        timed_examples=timed_examples,
+        num_epochs=num_epochs,
+    )
+
+    print(
+        f'Training FPS: {metrics.examples_per_sec:.1f} examples/s '
+        f'({metrics.timed_examples} examples in {metrics.train_time_sec:.2f}s, '
+        f'after {warmup_epochs} warmup epoch(s))'
+    )
+    print(f'Test accuracy: {metrics.test_accuracy * 100:.2f}%')
+
+    return params, key, metrics
+
+def run_training_run(
+    accum_method,
+    args,
+    train_images,
+    train_labels,
+    test_images,
+    test_labels,
+    key,
+):
+    batch_config = resolve_batch_config(
+        args.batch_size, accum_method, args.accum_steps)
+    model = Net()
+    params, opt_state, grad_fn, tx, loss_fn = init_training_state(
+        model,
+        accum_method,
+        args.accum_steps,
+        batch_config,
+        key,
+        train_images[0:1],
+    )
+
+    print(f'\n=== {accum_method} ===')
+    _, _, metrics = train(
+        model,
+        params,
+        opt_state,
+        grad_fn,
+        tx,
+        loss_fn,
+        train_images,
+        train_labels,
+        test_images,
+        test_labels,
+        key,
+        accum_method,
+        batch_config,
+        num_epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+    )
+    return metrics
+
+def run_compare_all(args, train_images, train_labels, test_images, test_labels, key):
+    accum_steps = args.accum_steps
+    batch_config = resolve_batch_config(args.batch_size, 'multisteps', accum_steps)
+    methods = ['none', 'multisteps', 'microbatch']
+    results = []
+
+    print(
+        f'Full training compare: epochs={args.epochs}, '
+        f'effective_batch={batch_config.effective_batch_size}, '
+        f'microbatch={batch_config.microbatch_size}, '
+        f'accum_steps={accum_steps}, '
+        f'warmup_epochs={args.warmup_epochs}'
+    )
+
+    for method in methods:
+        key, method_key = random.split(key)
+        metrics = run_training_run(
+            method,
+            args,
+            train_images,
+            train_labels,
+            test_images,
+            test_labels,
+            method_key,
+        )
+        results.append((method, metrics))
+
+    print(f'\n{"Method":<12} {"Examples/s":>12} {"Accuracy":>10} {"Time (s)":>10}')
+    print('-' * 48)
+    for method, metrics in results:
+        print(
+            f'{method:<12} '
+            f'{metrics.examples_per_sec:>12.1f} '
+            f'{metrics.test_accuracy * 100:>9.2f}% '
+            f'{metrics.train_time_sec:>10.2f}'
+        )
+
+    return results
 
 def load_data():
     ds_builder = tfds.builder('mnist')
@@ -382,12 +534,14 @@ def load_data():
 def main():
     args = parse_args()
     accum_method = resolve_accum_method(args)
-    batch_config = resolve_batch_config(
-        args.batch_size, accum_method, args.accum_steps)
     if args.accum_steps < 1:
         raise ValueError('--accum-steps must be >= 1')
     if args.batch_size < 1:
         raise ValueError('--batch-size must be >= 1')
+    if args.epochs < 1:
+        raise ValueError('--epochs must be >= 1')
+    if args.warmup_epochs < 0 or args.warmup_epochs >= args.epochs:
+        raise ValueError('--warmup-epochs must be >= 0 and < --epochs')
     if args.benchmark_steps < 1:
         raise ValueError('--benchmark-steps must be >= 1')
     if args.warmup_steps < 0:
@@ -400,36 +554,21 @@ def main():
         run_benchmark(args, train_images, train_labels, key)
         return
 
-    model = Net()
-    params, opt_state, grad_fn, tx, loss_fn = init_training_state(
-        model,
-        accum_method,
-        args.accum_steps,
-        batch_config,
-        key,
-        train_images[0:1],
-    )
-    key = random.PRNGKey(0)
+    if args.compare_all:
+        run_compare_all(
+            args, train_images, train_labels, test_images, test_labels, key)
+        return
 
-    params, key = train(
-        model,
-        params,
-        opt_state,
-        grad_fn,
-        tx,
-        loss_fn,
+    key, train_key = random.split(key)
+    run_training_run(
+        accum_method,
+        args,
         train_images,
         train_labels,
-        key,
-        accum_method,
-        batch_config,
-        num_epochs=5,
+        test_images,
+        test_labels,
+        train_key,
     )
-
-    test_logits = model.apply(params, test_images, training=False)
-    test_predictions = jnp.argmax(test_logits, axis=-1)
-    accuracy = jnp.mean(test_predictions == test_labels)
-    print(f'Test accuracy: {accuracy * 100:.2f}%')
 
 if __name__ == '__main__':
     main()
